@@ -68,6 +68,7 @@ class ApkFinishPayload(BaseModel):
 class ApkUpdatePayload(BaseModel):
     version: str = Field(min_length=1, max_length=40)
     notes: str = Field(default="", max_length=1500)
+    filename: str | None = Field(default=None, max_length=120)
     # Optional direct APK URL. Supplying it lets the admin create a release
     # without uploading the APK to this website, or replace the current link.
     download_url: str | None = Field(default=None, max_length=2048)
@@ -127,7 +128,8 @@ button{border:0;border-radius:12px;padding:13px 17px;background:linear-gradient(
 <div class="field"><label for="apkFile">Select APK file</label><div class="drop" id="apkDrop"><div class="fileicon">📦</div><b>Choose your APK file</b><span>or tap to browse · .apk · maximum 150 MB</span><div class="filename" id="apkFilename">No APK selected</div></div><input id="apkFile" type="file" accept=".apk,application/vnd.android.package-archive"></div>
 <div class="fields">
 <div class="field"><label for="apkVersion">App version</label><input id="apkVersion" type="text" placeholder="Example: 1.0.1" maxlength="40"></div>
-<div class="field"><label for="apkDownloadUrl">Direct APK download URL</label><input id="apkDownloadUrl" type="url" placeholder="https://example.com/app.apk" maxlength="2048" inputmode="url"></div>
+<div class="field"><label for="apkFileName">APK download filename</label><input id="apkFileName" type="text" value="youssef-tv.apk" placeholder="youssef-tv.apk" maxlength="120"></div>
+<div class="field full"><label for="apkDownloadUrl">Direct APK download URL (optional when uploading)</label><input id="apkDownloadUrl" type="url" placeholder="https://example.com/app.apk" maxlength="2048" inputmode="url"></div>
 <div class="field full"><label for="apkNotes">Release notes</label><textarea id="apkNotes" placeholder="What changed in this version?" maxlength="1500"></textarea></div>
 </div>
 <button class="upload" id="apkUpload" disabled>Upload APK file to Blob</button>
@@ -167,7 +169,7 @@ async function refreshApk(){
   if(r.status===404){
    currentApk=null;$('apkCurrentTitle').textContent='No APK release configured';
    $('apkCurrentMeta').textContent='Enter a version and direct APK URL below, then save to create the update JSON.';
-   $('apkVersion').value='';$('apkDownloadUrl').value='';$('apkNotes').value='';
+   $('apkVersion').value='';$('apkFileName').value='youssef-tv.apk';$('apkDownloadUrl').value='';$('apkNotes').value='';
    $('deleteApk').disabled=true;$('saveApkInfo').disabled=false;return;
   }
   const d=await readJson(r);currentApk=d;
@@ -175,6 +177,7 @@ async function refreshApk(){
   const sizeText=d.size>0?' · '+(d.size/1024/1024).toFixed(2)+' MB':'';
   $('apkCurrentMeta').textContent=(d.filename||'app.apk')+sizeText+(d.notes?' · '+d.notes:'')+' · Updated '+(d.updated_at||'');
   $('apkVersion').value=d.version||'';
+  $('apkFileName').value=d.filename||'youssef-tv.apk';
   $('apkDownloadUrl').value=d.apk_url||d.direct_download_url||'';
   $('apkNotes').value=d.notes||'';
   $('deleteApk').disabled=false;$('saveApkInfo').disabled=false;
@@ -188,7 +191,7 @@ apkUpload.addEventListener('click',async()=>{
  apkUpload.disabled=true;apkUpload.textContent='Uploading…';clearStatus(apkStatus);$('apkProgress').style.display='block';$('apkProgressBar').style.width='0%';
  let uploadId=null;
  try{
-  const start=await readJson(await fetch('/api/apk/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:apkChosen.name,size:apkChosen.size,version,notes:$('apkNotes').value})}));
+  const start=await readJson(await fetch('/api/apk/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:$('apkFileName').value.trim()||'youssef-tv.apk',size:apkChosen.size,version,notes:$('apkNotes').value})}));
   uploadId=start.upload_id;const chunkSize=start.chunk_size;const count=start.chunk_count;
   for(let i=0;i<count;i++){
    const startAt=i*chunkSize,endAt=Math.min(apkChosen.size,startAt+chunkSize),piece=apkChosen.slice(startAt,endAt);
@@ -204,11 +207,11 @@ apkUpload.addEventListener('click',async()=>{
 });
 
 $('saveApkInfo').addEventListener('click',async()=>{
- const version=$('apkVersion').value.trim(),download_url=$('apkDownloadUrl').value.trim();
+ const version=$('apkVersion').value.trim(),download_url=$('apkDownloadUrl').value.trim(),filename=$('apkFileName').value.trim()||'youssef-tv.apk';
  if(!version){showStatus(apkStatus,'Enter an app version.','error');return}
  if(!download_url){showStatus(apkStatus,'Enter a direct APK download URL.','error');return}
  try{
-  const d=await readJson(await fetch('/api/apk/update-info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version,download_url,notes:$('apkNotes').value})}));
+  const d=await readJson(await fetch('/api/apk/update-info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version,download_url,filename,notes:$('apkNotes').value})}));
   showStatus(apkStatus,'Update JSON saved. Version '+d.version+'. Stable download link: '+d.download_url,'ok');
   await refreshApk();
  }catch(e){showStatus(apkStatus,e.message,'error')}
@@ -331,12 +334,21 @@ async def cleanup_pending_apk(upload_id: str, chunk_count: int) -> None:
         pass
 
 
-def make_download_url(url: str, download_url: str | None = None) -> str:
-    if download_url:
-        return download_url
-    parts = urlsplit(url)
+def clean_apk_filename(value: str | None, fallback: str = "youssef-tv.apk") -> str:
+    name = Path((value or fallback).strip()).name
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-_")
+    if not name:
+        name = fallback
+    if not name.lower().endswith(".apk"):
+        name += ".apk"
+    return name[:120]
+
+
+def make_download_url(url: str, download_url: str | None = None, filename: str = "youssef-tv.apk") -> str:
+    # Ensure the Blob CDN receives an explicit download filename.
+    parts = urlsplit(download_url or url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query["download"] = "1"
+    query["download"] = clean_apk_filename(filename)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -421,9 +433,7 @@ async def serve_playlist(file_id: str):
 @app.post("/api/apk/start")
 async def start_apk_upload(payload: ApkStartPayload, request: Request):
     require_login(request)
-    filename = Path(payload.filename).name
-    if not filename.lower().endswith(".apk"):
-        raise HTTPException(status_code=400, detail="Please choose an .apk file")
+    filename = clean_apk_filename(payload.filename)
     if payload.size > MAX_APK_BYTES:
         raise HTTPException(status_code=413, detail="APK is too large. Maximum size is 150 MB")
 
@@ -534,6 +544,7 @@ async def finish_apk_upload(payload: ApkFinishPayload, request: Request):
     download_url = make_download_url(
         uploaded.url,
         getattr(uploaded, "download_url", None),
+        state["filename"],
     )
     manifest = {
         "filename": state["filename"],
@@ -595,7 +606,7 @@ async def latest_apk_info(request: Request):
     return JSONResponse(
         {
             "success": True,
-            "filename": manifest.get("filename", "app.apk"),
+            "filename": manifest.get("filename", "youssef-tv.apk"),
             "version": manifest.get("version", "1.0.0"),
             "notes": manifest.get("notes", ""),
             "size": int(manifest.get("size", 0)),
@@ -617,6 +628,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
     require_login(request)
     manifest = await get_apk_current()
 
+    requested_filename = clean_apk_filename(payload.filename)
     direct_url = None
     if payload.download_url is not None:
         direct_url = payload.download_url.strip()
@@ -635,9 +647,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
     if manifest is None:
         if not direct_url:
             raise HTTPException(status_code=400, detail="Enter a direct APK download URL to create the first release")
-        filename = Path(urlsplit(direct_url).path).name or "app.apk"
-        if not filename.lower().endswith(".apk"):
-            filename = "app.apk"
+        filename = requested_filename
         manifest = {
             "filename": filename,
             "version": payload.version.strip(),
@@ -651,6 +661,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
         }
     else:
         manifest["version"] = payload.version.strip()
+        manifest["filename"] = requested_filename
         manifest["notes"] = payload.notes.strip()
         current_direct_url = manifest.get("download_url") or manifest.get("url")
         if direct_url and direct_url != current_direct_url:
@@ -659,8 +670,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
             manifest["url"] = direct_url
             manifest["download_url"] = direct_url
             manifest["source"] = "external"
-            filename = Path(urlsplit(direct_url).path).name or "app.apk"
-            manifest["filename"] = filename if filename.lower().endswith(".apk") else "app.apk"
+            manifest["filename"] = requested_filename
             manifest["size"] = 0
             # The previous Blob file is no longer current. Do not let deleting
             # this external-link release delete an unrelated old Blob object.
@@ -671,6 +681,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
     return {
         "success": True,
         "version": manifest["version"],
+        "filename": manifest.get("filename", "youssef-tv.apk"),
         "notes": manifest.get("notes", ""),
         "download_url": f"{get_site_origin(request)}/app.apk",
         "apk_url": manifest.get("download_url") or manifest.get("url"),
