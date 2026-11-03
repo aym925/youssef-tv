@@ -441,8 +441,8 @@ async def serve_playlist(file_id: str):
 
 # ---------------------------------------------------------------------------
 # APK publishing. A browser sends only 3 MB pieces to this Function. The
-# Function stores each piece in Blob, joins them server-side, publishes one
-# versioned APK object, then /app.apk redirects to its direct download URL.
+# Function stores each piece in Blob, then republishes the APK with Vercel
+# Blob multipart upload, and /app.apk redirects to its direct download URL.
 # ---------------------------------------------------------------------------
 @app.post("/api/apk/start")
 async def start_apk_upload(payload: ApkStartPayload, request: Request):
@@ -518,43 +518,69 @@ async def finish_apk_upload(payload: ApkFinishPayload, request: Request):
     if expected_size <= 0 or expected_size > MAX_APK_BYTES:
         raise HTTPException(status_code=400, detail="Invalid APK upload size")
 
-    # All incoming requests are small, so Vercel never receives the full APK
-    # as a Function request body. The final Blob upload is server-to-Blob.
-    assembled = bytearray()
-    for index in range(chunk_count):
-        chunk_path = f"{APK_TEMP_PREFIX}/{payload.upload_id}/{index:06d}.part"
-        try:
-            part = await blob.get_blob(chunk_path, access="public")
-        except Exception as exc:
-            if is_blob_not_found(exc):
-                raise HTTPException(status_code=400, detail=f"Upload is incomplete: missing part {index + 1} of {chunk_count}") from exc
-            raise blob_setup_error(exc, f"Reading APK part {index + 1} during final assembly") from exc
-
-        part_data = part.body
-        expected_part_size = min(chunk_size, expected_size - index * chunk_size)
-        if len(part_data) != expected_part_size:
-            raise HTTPException(status_code=400, detail=f"Upload part {index + 1} is incomplete. Please upload again.")
-        assembled.extend(part_data)
-
-    if len(assembled) != expected_size:
-        raise HTTPException(status_code=400, detail="The uploaded APK size does not match the original file size")
-    if not assembled.startswith(b"PK"):
-        raise HTTPException(status_code=400, detail="The selected file does not look like a valid APK archive")
+    # Keep each browser request small (3 MiB), then publish the APK with
+    # Vercel Blob's multipart API. A normal server-side Blob upload is not
+    # suitable for larger files; multipart parts must be >= 5 MiB except last.
+    MULTIPART_PART_BYTES = 5 * 1024 * 1024
+    pending_part = bytearray()
+    received_size = 0
+    first_bytes = bytearray()
 
     release_id = uuid.uuid4().hex
     release_path = f"{APK_RELEASE_PREFIX}/{release_id}.apk"
+    multipart_factory = getattr(blob, "multipart_upload_blob", None)
+    if multipart_factory is None:
+        raise HTTPException(
+            status_code=503,
+            detail="The installed Vercel Blob Python SDK is too old for large APK uploads. Update the 'vercel' package to a version that supports multipart_upload_blob, then redeploy.",
+        )
+
     try:
-        uploaded = await blob.put_blob(
+        async with multipart_factory(
             release_path,
-            bytes(assembled),
             access="public",
             content_type="application/vnd.android.package-archive",
             add_random_suffix=False,
             allow_overwrite=False,
             cache_control_max_age=60,
-        )
+        ) as multipart:
+            for index in range(chunk_count):
+                chunk_path = f"{APK_TEMP_PREFIX}/{payload.upload_id}/{index:06d}.part"
+                try:
+                    part = await blob.get_blob(chunk_path, access="public")
+                except Exception as exc:
+                    if is_blob_not_found(exc):
+                        raise HTTPException(status_code=400, detail=f"Upload is incomplete: missing part {index + 1} of {chunk_count}") from exc
+                    raise blob_setup_error(exc, f"Reading APK part {index + 1} during final assembly") from exc
+
+                part_data = part.body
+                expected_part_size = min(chunk_size, expected_size - index * chunk_size)
+                if len(part_data) != expected_part_size:
+                    raise HTTPException(status_code=400, detail=f"Upload part {index + 1} is incomplete. Please upload again.")
+
+                received_size += len(part_data)
+                if len(first_bytes) < 2:
+                    first_bytes.extend(part_data[:2 - len(first_bytes)])
+                pending_part.extend(part_data)
+
+                # Upload full 5 MiB parts in order. Only the final part may be smaller.
+                while len(pending_part) >= MULTIPART_PART_BYTES:
+                    upload_part_data = bytes(pending_part[:MULTIPART_PART_BYTES])
+                    del pending_part[:MULTIPART_PART_BYTES]
+                    await multipart.upload_part(upload_part_data)
+
+            if received_size != expected_size:
+                raise HTTPException(status_code=400, detail="The uploaded APK size does not match the original file size")
+            if bytes(first_bytes) != b"PK":
+                raise HTTPException(status_code=400, detail="The selected file does not look like a valid APK archive")
+            if pending_part:
+                await multipart.upload_part(bytes(pending_part))
+
+        uploaded = multipart.result
+    except HTTPException:
+        raise
     except Exception as exc:
-        raise blob_setup_error(exc, "Publishing the completed APK file") from exc
+        raise blob_setup_error(exc, "Multipart publishing the completed APK file") from exc
 
     download_url = make_download_url(
         uploaded.url,
