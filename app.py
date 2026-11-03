@@ -68,6 +68,9 @@ class ApkFinishPayload(BaseModel):
 class ApkUpdatePayload(BaseModel):
     version: str = Field(min_length=1, max_length=40)
     notes: str = Field(default="", max_length=1500)
+    # Optional direct APK URL. Supplying it lets the admin create a release
+    # without uploading the APK to this website, or replace the current link.
+    download_url: str | None = Field(default=None, max_length=2048)
 
 
 LOGIN_HTML = r'''<!doctype html>
@@ -120,17 +123,18 @@ button{border:0;border-radius:12px;padding:13px 17px;background:linear-gradient(
 <section class="panel">
 <h1 class="heading">Android APK Manager <span class="pill">Stable download link</span></h1>
 <p class="lead">Upload an APK and set its version. The download address stays the same when you publish a newer APK.</p>
-<div class="apk-current" id="apkCurrent"><strong id="apkCurrentTitle">Loading current release…</strong><div class="small" id="apkCurrentMeta"></div><div class="actions"><button class="secondary" id="copyApkLink" type="button">Copy stable APK link</button><button class="secondary" id="openApkLink" type="button">Open download link</button></div></div>
+<div class="apk-current" id="apkCurrent"><strong id="apkCurrentTitle">Loading current release…</strong><div class="small" id="apkCurrentMeta"></div><div class="actions"><button class="secondary" id="copyApkLink" type="button">Copy stable APK link</button><button class="secondary" id="copyJsonLink" type="button">Copy JSON link</button><button class="secondary" id="openApkLink" type="button">Open download link</button></div></div>
 <div class="field"><label for="apkFile">Select APK file</label><div class="drop" id="apkDrop"><div class="fileicon">📦</div><b>Choose your APK file</b><span>or tap to browse · .apk · maximum 150 MB</span><div class="filename" id="apkFilename">No APK selected</div></div><input id="apkFile" type="file" accept=".apk,application/vnd.android.package-archive"></div>
 <div class="fields">
 <div class="field"><label for="apkVersion">App version</label><input id="apkVersion" type="text" placeholder="Example: 1.0.1" maxlength="40"></div>
-<div class="field"><label for="apkNotes">Release notes</label><textarea id="apkNotes" placeholder="What changed in this version?" maxlength="1500"></textarea></div>
+<div class="field"><label for="apkDownloadUrl">Direct APK download URL</label><input id="apkDownloadUrl" type="url" placeholder="https://example.com/app.apk" maxlength="2048" inputmode="url"></div>
+<div class="field full"><label for="apkNotes">Release notes</label><textarea id="apkNotes" placeholder="What changed in this version?" maxlength="1500"></textarea></div>
 </div>
-<button class="upload" id="apkUpload" disabled>Upload and publish APK</button>
+<button class="upload" id="apkUpload" disabled>Upload APK file to Blob</button>
 <div class="progress-wrap" id="apkProgress"><div class="progress-track"><div class="progress-bar" id="apkProgressBar"></div></div><div class="progress-label" id="apkProgressLabel">Preparing upload…</div></div>
 <div class="status" id="apkStatus"></div>
-<div class="actions"><button class="secondary" id="saveApkInfo" type="button">Save version details</button><button class="danger" id="deleteApk" type="button">Delete current APK</button></div>
-<p class="hint">Public download URL: <b>/app.apk</b>. Anyone opening it starts downloading the current APK. Version information is available at <b>/api/app/latest</b>.</p>
+<div class="actions"><button class="secondary" id="saveApkInfo" type="button">Save / update version and APK link</button><button class="danger" id="deleteApk" type="button" disabled>Delete current release</button></div>
+<p class="hint">Stable JSON for your app: <b>/app.json</b> (also available at <b>/api/app/latest</b>). Stable download link: <b>/app.apk</b>. Enter a direct APK URL above and press “Save / update version and APK link” to publish or replace the URL without uploading a file. The JSON returns the current version and stable download URL.</p>
 </section>
 <div class="bottom">Private admin area · M3U & APK Manager</div></main>
 <script>
@@ -157,7 +161,25 @@ function setApkFile(file){if(!file)return;apkChosen=file;$('apkFilename').textCo
 apkDrop.addEventListener('click',()=>apkInput.click());apkInput.addEventListener('change',()=>setApkFile(apkInput.files[0]));
 apkDrop.addEventListener('dragover',e=>{e.preventDefault();apkDrop.classList.add('over')});apkDrop.addEventListener('dragleave',()=>apkDrop.classList.remove('over'));apkDrop.addEventListener('drop',e=>{e.preventDefault();apkDrop.classList.remove('over');setApkFile(e.dataTransfer.files[0])});
 
-async function refreshApk(){try{const r=await fetch('/api/app/latest',{cache:'no-store'});if(r.status===404){currentApk=null;$('apkCurrentTitle').textContent='No APK published yet';$('apkCurrentMeta').textContent='Choose an APK below to publish your first release.';$('deleteApk').disabled=true;$('saveApkInfo').disabled=true;return}const d=await readJson(r);currentApk=d;$('apkCurrentTitle').textContent='Current version: '+d.version;$('apkCurrentMeta').textContent=d.filename+' · '+(d.size/1024/1024).toFixed(2)+' MB'+(d.notes?' · '+d.notes:'')+' · Updated '+d.updated_at;$('apkVersion').value=d.version;$('apkNotes').value=d.notes||'';$('deleteApk').disabled=false;$('saveApkInfo').disabled=false}catch(e){$('apkCurrentTitle').textContent='Could not load APK details';$('apkCurrentMeta').textContent=e.message}}
+async function refreshApk(){
+ try{
+  const r=await fetch('/api/app/latest',{cache:'no-store'});
+  if(r.status===404){
+   currentApk=null;$('apkCurrentTitle').textContent='No APK release configured';
+   $('apkCurrentMeta').textContent='Enter a version and direct APK URL below, then save to create the update JSON.';
+   $('apkVersion').value='';$('apkDownloadUrl').value='';$('apkNotes').value='';
+   $('deleteApk').disabled=true;$('saveApkInfo').disabled=false;return;
+  }
+  const d=await readJson(r);currentApk=d;
+  $('apkCurrentTitle').textContent='Current version: '+d.version;
+  const sizeText=d.size>0?' · '+(d.size/1024/1024).toFixed(2)+' MB':'';
+  $('apkCurrentMeta').textContent=(d.filename||'app.apk')+sizeText+(d.notes?' · '+d.notes:'')+' · Updated '+(d.updated_at||'');
+  $('apkVersion').value=d.version||'';
+  $('apkDownloadUrl').value=d.apk_url||d.direct_download_url||'';
+  $('apkNotes').value=d.notes||'';
+  $('deleteApk').disabled=false;$('saveApkInfo').disabled=false;
+ }catch(e){$('apkCurrentTitle').textContent='Could not load APK details';$('apkCurrentMeta').textContent=e.message}
+}
 
 apkUpload.addEventListener('click',async()=>{
  if(!apkChosen)return;
@@ -181,9 +203,19 @@ apkUpload.addEventListener('click',async()=>{
  finally{apkUpload.disabled=!apkChosen;apkUpload.textContent='Upload and publish APK';$('apkProgress').style.display='none'}
 });
 
-$('saveApkInfo').addEventListener('click',async()=>{const version=$('apkVersion').value.trim();if(!version){showStatus(apkStatus,'Enter an app version.','error');return}try{const d=await readJson(await fetch('/api/apk/update-info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version,notes:$('apkNotes').value})}));showStatus(apkStatus,'Version information updated. Current version: '+d.version,'ok');await refreshApk()}catch(e){showStatus(apkStatus,e.message,'error')}});
+$('saveApkInfo').addEventListener('click',async()=>{
+ const version=$('apkVersion').value.trim(),download_url=$('apkDownloadUrl').value.trim();
+ if(!version){showStatus(apkStatus,'Enter an app version.','error');return}
+ if(!download_url){showStatus(apkStatus,'Enter a direct APK download URL.','error');return}
+ try{
+  const d=await readJson(await fetch('/api/apk/update-info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version,download_url,notes:$('apkNotes').value})}));
+  showStatus(apkStatus,'Update JSON saved. Version '+d.version+'. Stable download link: '+d.download_url,'ok');
+  await refreshApk();
+ }catch(e){showStatus(apkStatus,e.message,'error')}
+});
 $('deleteApk').addEventListener('click',async()=>{if(!currentApk)return;if(!confirm('Delete the current APK release? The stable download link will stop working.'))return;try{await readJson(await fetch('/api/apk/current',{method:'DELETE'}));showStatus(apkStatus,'Current APK deleted.','ok');await refreshApk()}catch(e){showStatus(apkStatus,e.message,'error')}});
 $('copyApkLink').addEventListener('click',()=>copyText(location.origin+'/app.apk',$('copyApkLink')));
+$('copyJsonLink').addEventListener('click',()=>copyText(location.origin+'/app.json',$('copyJsonLink')));
 $('openApkLink').addEventListener('click',()=>window.open('/app.apk','_blank','noopener'));
 $('logout').addEventListener('click',async()=>{await fetch('/api/logout',{method:'POST'});location.reload()});
 refreshApk();
@@ -551,11 +583,15 @@ async def download_current_apk():
     )
 
 
+@app.get("/app.json")
 @app.get("/api/app/latest")
-async def latest_apk_info():
+async def latest_apk_info(request: Request):
     manifest = await get_apk_current()
     if not manifest:
         raise HTTPException(status_code=404, detail="No APK has been published yet")
+
+    stable_download_url = f"{get_site_origin(request)}/app.apk"
+    direct_download_url = manifest.get("download_url") or manifest.get("url")
     return JSONResponse(
         {
             "success": True,
@@ -564,7 +600,13 @@ async def latest_apk_info():
             "notes": manifest.get("notes", ""),
             "size": int(manifest.get("size", 0)),
             "updated_at": manifest.get("updated_at", ""),
-            "download_url": "/app.apk",
+            # Keep these app-facing names stable. `download_url` is the
+            # permanent URL on this site; `/app.apk` redirects to the active
+            # direct APK URL that the admin can edit at any time.
+            "url": stable_download_url,
+            "download_url": stable_download_url,
+            "apk_url": direct_download_url,
+            "direct_download_url": direct_download_url,
         },
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
@@ -574,13 +616,65 @@ async def latest_apk_info():
 async def update_apk_info(payload: ApkUpdatePayload, request: Request):
     require_login(request)
     manifest = await get_apk_current()
-    if not manifest:
-        raise HTTPException(status_code=404, detail="No APK has been published yet")
-    manifest["version"] = payload.version.strip()
-    manifest["notes"] = payload.notes.strip()
-    manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    direct_url = None
+    if payload.download_url is not None:
+        direct_url = payload.download_url.strip()
+        parsed = urlsplit(direct_url)
+        if (
+            not direct_url
+            or parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise HTTPException(status_code=400, detail="APK URL must be a valid public http:// or https:// link")
+
+    # Creating a release by URL is supported even when no APK was uploaded
+    # to Blob first. The fixed /app.apk URL and JSON endpoint then work alike.
+    if manifest is None:
+        if not direct_url:
+            raise HTTPException(status_code=400, detail="Enter a direct APK download URL to create the first release")
+        filename = Path(urlsplit(direct_url).path).name or "app.apk"
+        if not filename.lower().endswith(".apk"):
+            filename = "app.apk"
+        manifest = {
+            "filename": filename,
+            "version": payload.version.strip(),
+            "notes": payload.notes.strip(),
+            "size": 0,
+            "pathname": None,
+            "url": direct_url,
+            "download_url": direct_url,
+            "source": "external",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    else:
+        manifest["version"] = payload.version.strip()
+        manifest["notes"] = payload.notes.strip()
+        current_direct_url = manifest.get("download_url") or manifest.get("url")
+        if direct_url and direct_url != current_direct_url:
+            # Replacing the download link is immediate; the stable JSON and
+            # /app.apk endpoints both point to this new URL after saving.
+            manifest["url"] = direct_url
+            manifest["download_url"] = direct_url
+            manifest["source"] = "external"
+            filename = Path(urlsplit(direct_url).path).name or "app.apk"
+            manifest["filename"] = filename if filename.lower().endswith(".apk") else "app.apk"
+            manifest["size"] = 0
+            # The previous Blob file is no longer current. Do not let deleting
+            # this external-link release delete an unrelated old Blob object.
+            manifest.pop("pathname", None)
+        manifest["updated_at"] = datetime.now(timezone.utc).isoformat()
+
     await write_json_blob(APK_CURRENT_MANIFEST, manifest, overwrite=True)
-    return {"success": True, "version": manifest["version"], "notes": manifest["notes"]}
+    return {
+        "success": True,
+        "version": manifest["version"],
+        "notes": manifest.get("notes", ""),
+        "download_url": f"{get_site_origin(request)}/app.apk",
+        "apk_url": manifest.get("download_url") or manifest.get("url"),
+    }
 
 
 @app.delete("/api/apk/current")
