@@ -4,7 +4,6 @@ import re
 import uuid
 from pathlib import Path
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
@@ -12,11 +11,17 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from vercel import blob
 
-load_dotenv()
 
-APP_NAME = "M3U Link Manager"
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin1234")
-SESSION_SECRET = os.getenv("SESSION_SECRET", "local-development-secret-change-this")
+APP_NAME = "YOUSSEF TV"
+
+# These defaults work without creating a .env file.
+# You can still override ADMIN_PASSWORD and SESSION_SECRET in Vercel settings.
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin12345678@")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "XpT29QXV1up75nPpudholA9OIkW5pdqJnqiJUtXeNQSzHBs3-Y1BUwGvVTOTlPJ0")
+
+# Vercel Blob reads this token from the Vercel project environment.
+# Keep the token in Vercel's Environment Variables; do not hard-code it here.
+BLOB_READ_WRITE_TOKEN = os.getenv("BLOB_READ_WRITE_TOKEN", "vercel_blob_rw_xh093eJfM9KYCHKv_BSB9CWEom8ee2dfELK85DxK5ARPBM2").strip()
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024  # Keep below Vercel Functions' 4.5 MB request limit.
 IS_VERCEL = os.getenv("VERCEL", "").lower() in {"1", "true"}
 
