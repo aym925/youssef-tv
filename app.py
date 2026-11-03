@@ -59,6 +59,7 @@ class ApkStartPayload(BaseModel):
     size: int = Field(gt=0, le=MAX_APK_BYTES)
     version: str = Field(min_length=1, max_length=40)
     notes: str = Field(default="", max_length=1500)
+    downloaders: int | None = Field(default=None, ge=0, le=2_000_000_000)
 
 
 class ApkFinishPayload(BaseModel):
@@ -69,6 +70,7 @@ class ApkUpdatePayload(BaseModel):
     version: str = Field(min_length=1, max_length=40)
     notes: str = Field(default="", max_length=1500)
     filename: str | None = Field(default=None, max_length=120)
+    downloaders: int | None = Field(default=None, ge=0, le=2_000_000_000)
     # Optional direct APK URL. Supplying it lets the admin create a release
     # without uploading the APK to this website, or replace the current link.
     download_url: str | None = Field(default=None, max_length=2048)
@@ -129,6 +131,7 @@ button{border:0;border-radius:12px;padding:13px 17px;background:linear-gradient(
 <div class="fields">
 <div class="field"><label for="apkVersion">App version</label><input id="apkVersion" type="text" placeholder="Example: 1.0.1" maxlength="40"></div>
 <div class="field"><label for="apkFileName">APK download filename</label><input id="apkFileName" type="text" value="youssef-tv.apk" placeholder="youssef-tv.apk" maxlength="120"></div>
+<div class="field"><label for="apkDownloaders">Downloaders (optional)</label><input id="apkDownloaders" type="number" min="0" step="1" placeholder="Leave empty if unknown"></div>
 <div class="field full"><label for="apkDownloadUrl">Direct APK download URL (optional when uploading)</label><input id="apkDownloadUrl" type="url" placeholder="https://example.com/app.apk" maxlength="2048" inputmode="url"></div>
 <div class="field full"><label for="apkNotes">Release notes</label><textarea id="apkNotes" placeholder="What changed in this version?" maxlength="1500"></textarea></div>
 </div>
@@ -169,7 +172,7 @@ async function refreshApk(){
   if(r.status===404){
    currentApk=null;$('apkCurrentTitle').textContent='No APK release configured';
    $('apkCurrentMeta').textContent='Enter a version and direct APK URL below, then save to create the update JSON.';
-   $('apkVersion').value='';$('apkFileName').value='youssef-tv.apk';$('apkDownloadUrl').value='';$('apkNotes').value='';
+   $('apkVersion').value='';$('apkFileName').value='youssef-tv.apk';$('apkDownloaders').value='';$('apkDownloadUrl').value='';$('apkNotes').value='';
    $('deleteApk').disabled=true;$('saveApkInfo').disabled=false;return;
   }
   const d=await readJson(r);currentApk=d;
@@ -178,6 +181,7 @@ async function refreshApk(){
   $('apkCurrentMeta').textContent=(d.filename||'app.apk')+sizeText+(d.notes?' · '+d.notes:'')+' · Updated '+(d.updated_at||'');
   $('apkVersion').value=d.version||'';
   $('apkFileName').value=d.filename||'youssef-tv.apk';
+  $('apkDownloaders').value=d.downloaders ?? '';
   $('apkDownloadUrl').value=d.apk_url||d.direct_download_url||'';
   $('apkNotes').value=d.notes||'';
   $('deleteApk').disabled=false;$('saveApkInfo').disabled=false;
@@ -191,7 +195,7 @@ apkUpload.addEventListener('click',async()=>{
  apkUpload.disabled=true;apkUpload.textContent='Uploading…';clearStatus(apkStatus);$('apkProgress').style.display='block';$('apkProgressBar').style.width='0%';
  let uploadId=null;
  try{
-  const start=await readJson(await fetch('/api/apk/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:$('apkFileName').value.trim()||'youssef-tv.apk',size:apkChosen.size,version,notes:$('apkNotes').value})}));
+  const start=await readJson(await fetch('/api/apk/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:$('apkFileName').value.trim()||'youssef-tv.apk',size:apkChosen.size,version,notes:$('apkNotes').value,downloaders:$('apkDownloaders').value.trim()===''?null:Number($('apkDownloaders').value)})}));
   uploadId=start.upload_id;const chunkSize=start.chunk_size;const count=start.chunk_count;
   for(let i=0;i<count;i++){
    const startAt=i*chunkSize,endAt=Math.min(apkChosen.size,startAt+chunkSize),piece=apkChosen.slice(startAt,endAt);
@@ -211,7 +215,7 @@ $('saveApkInfo').addEventListener('click',async()=>{
  if(!version){showStatus(apkStatus,'Enter an app version.','error');return}
  if(!download_url){showStatus(apkStatus,'Enter a direct APK download URL.','error');return}
  try{
-  const d=await readJson(await fetch('/api/apk/update-info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version,download_url,filename,notes:$('apkNotes').value})}));
+  const d=await readJson(await fetch('/api/apk/update-info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({version,download_url,filename,notes:$('apkNotes').value,downloaders:$('apkDownloaders').value.trim()===''?null:Number($('apkDownloaders').value)})}));
   showStatus(apkStatus,'Update JSON saved. Version '+d.version+'. Stable download link: '+d.download_url,'ok');
   await refreshApk();
  }catch(e){showStatus(apkStatus,e.message,'error')}
@@ -266,14 +270,24 @@ def is_blob_not_found(exc: Exception) -> bool:
     return status == 404 or "not found" in message or "does not exist" in message
 
 
-def blob_setup_error(exc: Exception) -> HTTPException:
+def blob_setup_error(exc: Exception, operation: str = "Blob operation") -> HTTPException:
+    # Keep the exact failing stage visible in the admin UI. A 403 commonly
+    # means the token is invalid, belongs to another store, or is prefix-scoped.
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
     message = str(exc).lower()
-    if any(word in message for word in ("credential", "token", "store")):
+    if any(word in message for word in ("credential", "token", "store")) and status != 403:
         return HTTPException(
             status_code=503,
-            detail="Vercel Blob is not configured. Connect a PUBLIC Blob store to this Vercel project so BLOB_READ_WRITE_TOKEN is provided automatically.",
+            detail=f"{operation} failed: Blob credentials/store are not configured. Check BLOB_READ_WRITE_TOKEN and the connected Blob store.",
         )
-    return HTTPException(status_code=502, detail="Could not access Vercel Blob. Check the Blob store connection and try again.")
+    if status == 403 or "403" in message or "forbidden" in message:
+        return HTTPException(
+            status_code=502,
+            detail=f"{operation} was rejected by Vercel Blob (403 Forbidden). Check that BLOB_READ_WRITE_TOKEN belongs to this project's Blob store and has read/write access to the {APK_TEMP_PREFIX}/, {APK_RELEASE_PREFIX}/ and {APK_CURRENT_MANIFEST} paths. The M3U path may be permitted while APK paths are outside a restricted token prefix.",
+        )
+    token_value = os.getenv("BLOB_READ_WRITE_TOKEN") or "__NO_TOKEN__"
+    safe_message = str(exc).replace(token_value, "[hidden]")[:220]
+    return HTTPException(status_code=502, detail=f"{operation} failed while accessing Vercel Blob. {safe_message}")
 
 
 async def read_json_blob(pathname: str, *, missing_ok: bool = False):
@@ -282,7 +296,7 @@ async def read_json_blob(pathname: str, *, missing_ok: bool = False):
     except Exception as exc:
         if missing_ok and is_blob_not_found(exc):
             return None
-        raise blob_setup_error(exc) from exc
+        raise blob_setup_error(exc, f"Reading Blob object {pathname}") from exc
     try:
         return json.loads(result.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -302,7 +316,7 @@ async def write_json_blob(pathname: str, value: dict, *, overwrite: bool = True)
             cache_control_max_age=60,
         )
     except Exception as exc:
-        raise blob_setup_error(exc) from exc
+        raise blob_setup_error(exc, f"Writing Blob object {pathname}") from exc
 
 
 async def get_apk_current():
@@ -445,6 +459,7 @@ async def start_apk_upload(payload: ApkStartPayload, request: Request):
         "size": payload.size,
         "version": payload.version.strip(),
         "notes": payload.notes.strip(),
+        "downloaders": payload.downloaders,
         "chunk_size": APK_CHUNK_BYTES,
         "chunk_count": chunk_count,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -487,7 +502,7 @@ async def upload_apk_chunk(upload_id: str, index: int, request: Request, file: U
             cache_control_max_age=60,
         )
     except Exception as exc:
-        raise blob_setup_error(exc) from exc
+        raise blob_setup_error(exc, f"Uploading APK part {index + 1}") from exc
 
     return {"success": True, "index": index, "size": len(data)}
 
@@ -513,7 +528,7 @@ async def finish_apk_upload(payload: ApkFinishPayload, request: Request):
         except Exception as exc:
             if is_blob_not_found(exc):
                 raise HTTPException(status_code=400, detail=f"Upload is incomplete: missing part {index + 1} of {chunk_count}") from exc
-            raise blob_setup_error(exc) from exc
+            raise blob_setup_error(exc, f"Reading APK part {index + 1} during final assembly") from exc
 
         part_data = part.body
         expected_part_size = min(chunk_size, expected_size - index * chunk_size)
@@ -539,7 +554,7 @@ async def finish_apk_upload(payload: ApkFinishPayload, request: Request):
             cache_control_max_age=60,
         )
     except Exception as exc:
-        raise blob_setup_error(exc) from exc
+        raise blob_setup_error(exc, "Publishing the completed APK file") from exc
 
     download_url = make_download_url(
         uploaded.url,
@@ -550,6 +565,7 @@ async def finish_apk_upload(payload: ApkFinishPayload, request: Request):
         "filename": state["filename"],
         "version": state["version"],
         "notes": state.get("notes", ""),
+        "downloaders": state.get("downloaders"),
         "size": expected_size,
         "pathname": release_path,
         "url": uploaded.url,
@@ -573,6 +589,7 @@ async def finish_apk_upload(payload: ApkFinishPayload, request: Request):
         "filename": manifest["filename"],
         "version": manifest["version"],
         "size": expected_size,
+        "downloaders": manifest.get("downloaders"),
         "url": f"{get_site_origin(request)}/app.apk",
         "download_url": f"{get_site_origin(request)}/app.apk",
         "updated_at": manifest["updated_at"],
@@ -609,6 +626,7 @@ async def latest_apk_info(request: Request):
             "filename": manifest.get("filename", "youssef-tv.apk"),
             "version": manifest.get("version", "1.0.0"),
             "notes": manifest.get("notes", ""),
+            "downloaders": manifest.get("downloaders"),
             "size": int(manifest.get("size", 0)),
             "updated_at": manifest.get("updated_at", ""),
             # Keep these app-facing names stable. `download_url` is the
@@ -652,6 +670,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
             "filename": filename,
             "version": payload.version.strip(),
             "notes": payload.notes.strip(),
+            "downloaders": payload.downloaders,
             "size": 0,
             "pathname": None,
             "url": direct_url,
@@ -663,6 +682,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
         manifest["version"] = payload.version.strip()
         manifest["filename"] = requested_filename
         manifest["notes"] = payload.notes.strip()
+        manifest["downloaders"] = payload.downloaders
         current_direct_url = manifest.get("download_url") or manifest.get("url")
         if direct_url and direct_url != current_direct_url:
             # Replacing the download link is immediate; the stable JSON and
@@ -683,6 +703,7 @@ async def update_apk_info(payload: ApkUpdatePayload, request: Request):
         "version": manifest["version"],
         "filename": manifest.get("filename", "youssef-tv.apk"),
         "notes": manifest.get("notes", ""),
+        "downloaders": manifest.get("downloaders"),
         "download_url": f"{get_site_origin(request)}/app.apk",
         "apk_url": manifest.get("download_url") or manifest.get("url"),
     }
